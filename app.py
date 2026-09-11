@@ -10,36 +10,60 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "best.onnx")
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.35"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.5"))
 IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", "0.45"))
 INPUT_SIZE = int(os.environ.get("INPUT_SIZE", "640"))
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
 
-CLASS_NAMES = os.environ.get("CLASS_NAMES", "").split(",") if os.environ.get("CLASS_NAMES") else None
+# Class names for the [1, 62, 8400] YOLO model (58 classes). Read from the model's
+# own metadata ("names"). Override via CLASS_NAMES env var (comma-separated) if the
+# production model is retrained.
+_DEFAULT_CLASS_NAMES = [
+    "0", "Bed", "Cabinet", "Carpet", "Ceramic floor", "Chair", "Clock", "Closet",
+    "Computer", "Couch", "Cupboard", "Curtains", "Dining Table", "Door", "Frame",
+    "Gypsum Board", "Lamp", "Monitor", "Nightstand", "SOFA", "Shelf", "Sideboard",
+    "Sofa", "Swivel_C", "TV stand", "Table", "Transparent Closet", "Wall Futec",
+    "Wall Panel", "Window", "Windows", "Wooden floor", "air conditioner", "arm chair",
+    "bed", "ceiling fan", "chair", "closet", "cupboard", "dining table",
+    "dining-table", "dinning-table", "door", "drawer near bed", "frame",
+    "hanging lights", "lamp", "master bed", "nightstand", "photoframe", "shelf",
+    "sideboard", "sofa", "table", "transparent closet", "wall", "wardrobe", "windows",
+]
+
+CLASS_NAMES = (os.environ.get("CLASS_NAMES", "") or ",".join(_DEFAULT_CLASS_NAMES)).split(",")
 
 _DEFAULT_CLASS_MAP = {
+    # Model uses mixed casing (e.g. "Couch", "Dining Table", "TV stand"); maps are case-insensitive.
     "sofa": "sofa_3",
-    "couch": "sofa_3",
-    "loveseat": "sofa_2",
     "sofa 2 seat": "sofa_2",
     "sofa 3 seat": "sofa_3",
     "sofa2": "sofa_2",
     "sofa_2": "sofa_2",
     "sofa3": "sofa_3",
     "sofa_3": "sofa_3",
+    "couch": "sofa_3",
+    "loveseat": "sofa_2",
     "chair": "chair",
     "dining chair": "chair",
     "armchair": "armchair",
+    "arm chair": "armchair",
     "lounge chair": "armchair",
+    "swivel_c": "chair",
     "table": "table_rect",
     "dining table": "table_rect",
+    "dining-table": "table_rect",
+    "dinning-table": "table_rect",
     "round table": "table_round",
     "coffee table": "coffee",
     "desk": "desk",
+    "tv stand": "tv",
     "bed": "bed_d",
+    "master bed": "bed_d",
     "single bed": "bed_s",
     "double bed": "bed_d",
     "king bed": "bed_k",
+    "drawer near bed": "cabinet",
+    "nightstand": "cabinet",
     "toilet": "toilet",
     "sink": "sink",
     "bathtub": "bathtub",
@@ -52,17 +76,29 @@ _DEFAULT_CLASS_MAP = {
     "television": "tv",
     "tvmonitor": "tv",
     "monitor": "tv",
+    "computer": "tv",
     "bookshelf": "shelf",
     "bookcase": "shelf",
     "shelf": "shelf",
+    "sideboard": "cabinet",
     "cabinet": "cabinet",
     "wall cabinet": "wall_cab",
     "wardrobe": "wardrobe",
     "closet": "wardrobe",
+    "transparent closet": "wardrobe",
+    "cupboard": "cabinet",
     "door": "door",
     "window": "window",
+    "windows": "window",
     "rug": "rug",
     "carpet": "rug",
+    "wall": "wall",
+    "curtains": "wall_cab",
+    "ceiling fan": "wall_cab",
+    "air conditioner": "wall_cab",
+    "lamp": "tv",
+    "frame": "shelf",
+    "photoframe": "shelf",
 }
 
 
@@ -74,7 +110,6 @@ def _load_class_map():
         except json.JSONDecodeError:
             pass
     return dict(_DEFAULT_CLASS_MAP)
-
 
 CLASS_MAP = _load_class_map()
 
@@ -192,6 +227,17 @@ def _run_detection(image_b64: str):
 
     return {
         "detections": predictions,
+        "predictions": [
+            {
+                "class": p["class"],
+                "confidence": p["confidence"],
+                "x": p["x"],
+                "y": p["y"],
+                "width": p["width"],
+                "height": p["height"],
+            }
+            for p in predictions
+        ],
         "imageWidth": orig_w,
         "imageHeight": orig_h,
         "unmappedClasses": sorted(unmapped),
