@@ -8,17 +8,7 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: MODEL_PATH
-        value: best.onnx
-      - key: CONF_THRESHOLD
-        value: "0.35"
-      - key: IOU_THRESHOLD
-        value: "0.45"
+      - key: MODEL_NAME
+        value: claude-haiku-4-5-20251001
       - key: ALLOWED_ORIGINS
         value: "*"
-      # Optional: override if your model uses non-standard class names.
-      # CLASS_NAMES should be comma-separated, matching model output order.
-      # CLASS_MAP is JSON mapping model class names → FloorPlan furniture IDs.
-      # Example:
-      #   CLASS_NAMES: "sofa,chair,table,bed,toilet,plant,tv"
-      #   CLASS_MAP: '{"sofa":"sofa_3","chair":"chair","table":"table_rect","bed":"bed_d","toilet":"toilet","plant":"plant","tv":"tv"}'

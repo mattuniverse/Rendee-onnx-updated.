@@ -9,44 +9,43 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+MODEL_NAME = os.environ.get("MODEL_NAME", "claude-haiku-4-5-20251001")
+MAX_IMAGE_SIDE = int(os.environ.get("MAX_IMAGE_SIDE", "1568"))
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
 
 VALID_FURNITURE_IDS = [
     "sofa_2", "sofa_3", "chair", "armchair", "table_rect", "table_round",
-    "coffee", "desk", "bed_s", "bed_d", "bed_k", "cabinet", "wardrobe",
-    "shelf", "tv", "door", "window", "rug", "wall_cab", "plant", "toilet",
-    "sink", "bathtub",
+    "coffee", "desk", "tv", "bed_s", "bed_d", "bed_k", "cabinet", "wall_cab",
+    "toilet", "sink", "bathtub", "plant", "shelf", "wardrobe", "door", "window",
+    "rug", "wall",
 ]
 
-DETECTION_PROMPT = """You are a furniture detection AI for a floor plan tool.
+SYSTEM_PROMPT = """You are a furniture-detection engine for a floor-plan app. You receive a room photo and must return ONLY a JSON object — no prose, no markdown fences — describing every piece of furniture, fixture, or structural element (doors, windows, walls) visible in the image.
 
-Analyze this room image and detect ALL visible furniture and fixtures.
+Image dimensions will be given to you as imageWidth and imageHeight. All coordinates you output must be in pixel units on that same scale, using (x, y) as the CENTER of the bounding box, plus width and height — matching a standard object-detection box format, not corner coordinates.
 
-For each item detected, return a JSON object with these exact fields:
-- "furnitureId": one of these exact values only: sofa_2, sofa_3, chair, armchair, table_rect, table_round, coffee, desk, bed_s, bed_d, bed_k, cabinet, wardrobe, shelf, tv, door, window, rug, wall_cab, plant, toilet, sink, bathtub
-- "class": the natural name of the item (e.g. "Sofa", "Dining Chair", "Wardrobe")
-- "confidence": a number between 0 and 1 representing how confident you are
-- "x": estimated center x position in pixels from left edge
-- "y": estimated center y position in pixels from top edge
-- "width": estimated width in pixels
-- "height": estimated height in pixels
+Only use these furnitureId values (case-sensitive, exact match required). If an object doesn't clearly match one, omit furnitureId and instead add its label to "unmappedClasses":
+sofa_2, sofa_3, chair, armchair, table_rect, table_round, coffee, desk, tv, bed_s, bed_d, bed_k, cabinet, wall_cab, toilet, sink, bathtub, plant, shelf, wardrobe, door, window, rug, wall
+
+For each detected object return:
+- "class": your own descriptive label for what you saw (e.g. "dining chair")
+- "furnitureId": one of the allowed values above, or omit if none fit
+- "confidence": your estimated confidence from 0 to 1
+- "x", "y": center of the bounding box in pixels
+- "width", "height": box dimensions in pixels
 
 Rules:
-- sofa_2 = 2-seat sofa/loveseat, sofa_3 = 3-seat sofa/couch
-- bed_s = single/twin, bed_d = double/queen, bed_k = king
-- wall_cab = anything wall-mounted (AC unit, curtains, wall shelf, ceiling fan)
-- tv = television or monitor
-- Use table_rect for rectangular tables, table_round for round tables
-- If unsure between two furnitureIds, pick the closest one
-- Clamp all coordinates so they stay within the image boundaries
-- Detect EVERY visible item, do not skip small items like lamps or plants
+- Only report objects you can actually see and localize — do not guess at objects outside the frame or hallucinate typical room contents.
+- Give your best pixel-coordinate estimate; err toward tighter boxes around the visible object rather than the whole wall/floor area.
+- Do not include duplicate boxes for the same physical object.
+- Return valid JSON only, in this exact shape:
 
-Return ONLY a valid JSON array, no explanation, no markdown, no extra text.
-Example format:
-[
-  {"furnitureId": "sofa_3", "class": "Sofa", "confidence": 0.95, "x": 320, "y": 240, "width": 200, "height": 120},
-  {"furnitureId": "chair", "class": "Dining Chair", "confidence": 0.90, "x": 100, "y": 300, "width": 60, "height": 80}
-]
+{
+  "detections": [
+    { "furnitureId": "...", "class": "...", "confidence": 0.0, "x": 0, "y": 0, "width": 0, "height": 0 }
+  ],
+  "unmappedClasses": ["..."]
+}
 """
 
 app = FastAPI(title="FloorPlan Studio - furniture detection (Claude)")
@@ -70,15 +69,33 @@ def _detect_with_claude(image_b64: str):
 
     orig_w, orig_h = img.size
 
+    # Downscale server-side if larger than MAX_IMAGE_SIDE on the longest side —
+    # Claude bills/processes by resolution; bigger images cost more tokens for
+    # no accuracy gain. Coordinates are rescaled back to orig size below.
+    scale = min(1.0, MAX_IMAGE_SIDE / max(orig_w, orig_h))
+    scaled_w, scaled_h = int(round(orig_w * scale)), int(round(orig_h * scale))
+    scaled_img = img if scale >= 1.0 else img.resize((scaled_w, scaled_h), Image.LANCZOS)
+
     # Re-encode as JPEG for the API (smaller payload)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    scaled_img.save(buf, format="JPEG", quality=85)
     jpeg_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    media_type = "image/jpeg"
+    if scaled_img.format:
+        fmt = scaled_img.format.lower()
+        if fmt in ("png",):
+            media_type = "image/png"
+        elif fmt in ("gif",):
+            media_type = "image/gif"
+        elif fmt in ("webp",):
+            media_type = "image/webp"
 
     try:
         message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=2048,
+            model=MODEL_NAME,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
             messages=[{
                 "role": "user",
                 "content": [
@@ -86,11 +103,11 @@ def _detect_with_claude(image_b64: str):
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": "image/jpeg",
+                            "media_type": media_type,
                             "data": jpeg_b64,
                         },
                     },
-                    {"type": "text", "text": DETECTION_PROMPT},
+                    {"type": "text", "text": f"imageWidth: {scaled_w}\nimageHeight: {scaled_h}\n\nDetect all furniture, fixtures, and structural elements in this room photo."},
                 ],
             }],
         )
@@ -107,31 +124,46 @@ def _detect_with_claude(image_b64: str):
     raw = raw.strip()
 
     try:
-        detections = json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=502, detail=f"Claude returned invalid JSON: {raw[:200]}")
+        raise HTTPException(status_code=502, detail="Could not parse detection response.")
 
-    # Validate and clamp each detection
+    if isinstance(parsed, dict):
+        detected = parsed.get("detections", [])
+        unmapped = parsed.get("unmappedClasses", [])
+    elif isinstance(parsed, list):
+        detected = parsed
+        unmapped = []
+    else:
+        detected, unmapped = [], []
+
+    if not isinstance(detected, list):
+        detected = []
+    unmapped_classes = list(unmapped) if isinstance(unmapped, list) else []
+
+    # Validate furnitureIds and rescale coordinates back to original dimensions
     cleaned = []
-    for d in detections:
+    for d in detected:
         if not isinstance(d, dict):
             continue
         furniture_id = d.get("furnitureId", "")
+        cls = (d.get("class") or furniture_id or "").strip()
         if furniture_id not in VALID_FURNITURE_IDS:
-            continue  # drop unknown IDs
-        # Clamp coordinates to image bounds
-        w = min(float(d.get("width", 50)), orig_w)
-        h = min(float(d.get("height", 50)), orig_h)
-        x = max(w / 2, min(orig_w - w / 2, float(d.get("x", orig_w / 2))))
-        y = max(h / 2, min(orig_h - h / 2, float(d.get("y", orig_h / 2))))
+            if cls and cls not in unmapped_classes:
+                unmapped_classes.append(cls)
+            continue  # drop furnitureId, move class into unmappedClasses
+        rx = float(d.get("x", 0)) * (orig_w / scaled_w)
+        ry = float(d.get("y", 0)) * (orig_h / scaled_h)
+        rw = float(d.get("width", 0)) * (orig_w / scaled_w)
+        rh = float(d.get("height", 0)) * (orig_h / scaled_h)
         cleaned.append({
             "furnitureId": furniture_id,
-            "class": d.get("class", furniture_id),
+            "class": cls,
             "confidence": float(d.get("confidence", 0.9)),
-            "x": x,
-            "y": y,
-            "width": w,
-            "height": h,
+            "x": rx,
+            "y": ry,
+            "width": rw,
+            "height": rh,
         })
 
     return {
@@ -149,12 +181,13 @@ def _detect_with_claude(image_b64: str):
         ],
         "imageWidth": orig_w,
         "imageHeight": orig_h,
+        "unmappedClasses": unmapped_classes,
     }
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "model": "claude-haiku-4-5-20251001", "runtime": "anthropic"}
+    return {"status": "ok", "model": MODEL_NAME, "runtime": "claude-api"}
 
 
 @app.post("/api/detect-furniture")
