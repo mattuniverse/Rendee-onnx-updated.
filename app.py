@@ -3,117 +3,65 @@ import io
 import json
 import os
 
-import numpy as np
-import onnxruntime as ort
+import anthropic
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "best.onnx")
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.35"))
-IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", "0.45"))
-INPUT_SIZE = int(os.environ.get("INPUT_SIZE", "640"))
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
 
-CLASS_NAMES = os.environ.get("CLASS_NAMES", "").split(",") if os.environ.get("CLASS_NAMES") else None
+VALID_FURNITURE_IDS = [
+    "sofa_2", "sofa_3", "chair", "armchair", "table_rect", "table_round",
+    "coffee", "desk", "bed_s", "bed_d", "bed_k", "cabinet", "wardrobe",
+    "shelf", "tv", "door", "window", "rug", "wall_cab", "plant", "toilet",
+    "sink", "bathtub",
+]
 
-# ── Class name → FloorPlan Studio furnitureId mapping ──
-# Keys are lowercase model class names; values are FURNITURE_DEFS IDs.
-# Override via CLASS_MAP env var as JSON, e.g. {"sofa":"sofa_3","couch":"sofa_3"}
-_DEFAULT_CLASS_MAP = {
-    "sofa": "sofa_3",
-    "couch": "sofa_3",
-    "sofa2": "sofa_2",
-    "sofa_2": "sofa_2",
-    "sofa3": "sofa_3",
-    "sofa_3": "sofa_3",
-    "chair": "chair",
-    "dining_table": "table_rect",
-    "table": "table_rect",
-    "coffee_table": "coffee",
-    "desk": "desk",
-    "bed": "bed_d",
-    "single_bed": "bed_s",
-    "double_bed": "bed_d",
-    "king_bed": "bed_k",
-    "toilet": "toilet",
-    "sink": "sink",
-    "bathtub": "bathtub",
-    "tv": "tv",
-    "tvmonitor": "tv",
-    "monitor": "tv",
-    "potted_plant": "plant",
-    "plant": "plant",
-    "bookshelf": "shelf",
-    "shelf": "shelf",
-    "cabinet": "cabinet",
-    "wardrobe": "wardrobe",
-    "door": "door",
-    "window": "window",
-    "armchair": "armchair",
-    "rug": "rug",
-    "wall_cabinet": "wall_cab",
-}
+DETECTION_PROMPT = """You are a furniture detection AI for a floor plan tool.
 
-def _load_class_map():
-    env_map = os.environ.get("CLASS_MAP", "")
-    if env_map:
-        try:
-            return {k.lower(): v for k, v in json.loads(env_map).items()}
-        except json.JSONDecodeError:
-            pass
-    return dict(_DEFAULT_CLASS_MAP)
+Analyze this room image and detect ALL visible furniture and fixtures.
 
-CLASS_MAP = _load_class_map()
+For each item detected, return a JSON object with these exact fields:
+- "furnitureId": one of these exact values only: sofa_2, sofa_3, chair, armchair, table_rect, table_round, coffee, desk, bed_s, bed_d, bed_k, cabinet, wardrobe, shelf, tv, door, window, rug, wall_cab, plant, toilet, sink, bathtub
+- "class": the natural name of the item (e.g. "Sofa", "Dining Chair", "Wardrobe")
+- "confidence": a number between 0 and 1 representing how confident you are
+- "x": estimated center x position in pixels from left edge
+- "y": estimated center y position in pixels from top edge
+- "width": estimated width in pixels
+- "height": estimated height in pixels
 
-app = FastAPI(title="FloorPlan Studio - furniture detection (ONNX)")
+Rules:
+- sofa_2 = 2-seat sofa/loveseat, sofa_3 = 3-seat sofa/couch
+- bed_s = single/twin, bed_d = double/queen, bed_k = king
+- wall_cab = anything wall-mounted (AC unit, curtains, wall shelf, ceiling fan)
+- tv = television or monitor
+- Use table_rect for rectangular tables, table_round for round tables
+- If unsure between two furnitureIds, pick the closest one
+- Clamp all coordinates so they stay within the image boundaries
+- Detect EVERY visible item, do not skip small items like lamps or plants
+
+Return ONLY a valid JSON array, no explanation, no markdown, no extra text.
+Example format:
+[
+  {"furnitureId": "sofa_3", "class": "Sofa", "confidence": 0.95, "x": 320, "y": 240, "width": 200, "height": 120},
+  {"furnitureId": "chair", "class": "Dining Chair", "confidence": 0.90, "x": 100, "y": 300, "width": 60, "height": 80}
+]
+"""
+
+app = FastAPI(title="FloorPlan Studio - furniture detection (Claude)")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["POST"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
-input_name = session.get_inputs()[0].name
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def letterbox(img: Image.Image, size: int):
-    w, h = img.size
-    scale = min(size / w, size / h)
-    nw, nh = int(round(w * scale)), int(round(h * scale))
-    resized = img.resize((nw, nh), Image.BILINEAR)
-    canvas = Image.new("RGB", (size, size), (114, 114, 114))
-    pad_x, pad_y = (size - nw) // 2, (size - nh) // 2
-    canvas.paste(resized, (pad_x, pad_y))
-    return canvas, scale, pad_x, pad_y
-
-
-def nms(boxes, scores, iou_threshold):
-    if len(boxes) == 0:
-        return []
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-    keep = []
-    while order.size > 0:
-        i = order[0]
-        keep.append(int(i))
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
-        order = order[1:][iou <= iou_threshold]
-    return keep
-
-
-def _run_detection(image_b64: str):
-    """Core detection logic shared by all endpoints."""
+def _detect_with_claude(image_b64: str):
     try:
         image_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -121,154 +69,107 @@ def _run_detection(image_b64: str):
         raise HTTPException(status_code=400, detail="Could not decode image.")
 
     orig_w, orig_h = img.size
-    canvas, scale, pad_x, pad_y = letterbox(img, INPUT_SIZE)
 
-    arr = np.asarray(canvas, dtype=np.float32) / 255.0
-    arr = arr.transpose(2, 0, 1)[None, :, :, :]
+    # Re-encode as JPEG for the API (smaller payload)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    jpeg_b64 = base64.b64encode(buf.getvalue()).decode()
 
-    outputs = session.run(None, {input_name: arr})
-    pred = outputs[0]
-    if pred.shape[1] < pred.shape[2]:
-        pred = pred[0].T
-    else:
-        pred = pred[0]
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": jpeg_b64,
+                        },
+                    },
+                    {"type": "text", "text": DETECTION_PROMPT},
+                ],
+            }],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {str(e)}")
 
-    boxes_xywh = pred[:, :4]
-    class_scores = pred[:, 4:]
-    class_ids = np.argmax(class_scores, axis=1)
-    confidences = class_scores[np.arange(len(class_scores)), class_ids]
+    raw = message.content[0].text.strip()
 
-    mask = confidences >= CONF_THRESHOLD
-    boxes_xywh, class_ids, confidences = boxes_xywh[mask], class_ids[mask], confidences[mask]
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
 
-    predictions = []
-    unmapped = set()
+    try:
+        detections = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail=f"Claude returned invalid JSON: {raw[:200]}")
 
-    if len(boxes_xywh) > 0:
-        cx, cy, w, h = boxes_xywh[:, 0], boxes_xywh[:, 1], boxes_xywh[:, 2], boxes_xywh[:, 3]
-        x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
-        boxes_x1y1x2y2 = np.stack([x1, y1, x2, y2], axis=1)
-
-        keep = nms(boxes_x1y1x2y2, confidences, IOU_THRESHOLD)
-
-        for i in keep:
-            bcx = (cx[i] - pad_x) / scale
-            bcy = (cy[i] - pad_y) / scale
-            bw = w[i] / scale
-            bh = h[i] / scale
-            cls_id = int(class_ids[i])
-
-            # Resolve class name
-            if CLASS_NAMES and cls_id < len(CLASS_NAMES):
-                cls_name = CLASS_NAMES[cls_id]
-            else:
-                cls_name = str(cls_id)
-
-            cls_lower = cls_name.lower().strip()
-            furniture_id = CLASS_MAP.get(cls_lower)
-
-            if furniture_id:
-                predictions.append({
-                    "furnitureId": furniture_id,
-                    "class": cls_name,
-                    "confidence": float(confidences[i]),
-                    "x": float(bcx),
-                    "y": float(bcy),
-                    "width": float(bw),
-                    "height": float(bh),
-                })
-            else:
-                unmapped.add(cls_name)
+    # Validate and clamp each detection
+    cleaned = []
+    for d in detections:
+        if not isinstance(d, dict):
+            continue
+        furniture_id = d.get("furnitureId", "")
+        if furniture_id not in VALID_FURNITURE_IDS:
+            continue  # drop unknown IDs
+        # Clamp coordinates to image bounds
+        w = min(float(d.get("width", 50)), orig_w)
+        h = min(float(d.get("height", 50)), orig_h)
+        x = max(w / 2, min(orig_w - w / 2, float(d.get("x", orig_w / 2))))
+        y = max(h / 2, min(orig_h - h / 2, float(d.get("y", orig_h / 2))))
+        cleaned.append({
+            "furnitureId": furniture_id,
+            "class": d.get("class", furniture_id),
+            "confidence": float(d.get("confidence", 0.9)),
+            "x": x,
+            "y": y,
+            "width": w,
+            "height": h,
+        })
 
     return {
-        "detections": predictions,
+        "detections": cleaned,
+        "predictions": [
+            {
+                "class": d["class"],
+                "confidence": d["confidence"],
+                "x": d["x"],
+                "y": d["y"],
+                "width": d["width"],
+                "height": d["height"],
+            }
+            for d in cleaned
+        ],
         "imageWidth": orig_w,
         "imageHeight": orig_h,
-        "unmappedClasses": sorted(unmapped),
     }
 
 
-# ── Routes ──
-
 @app.get("/")
 def health():
-    return {"status": "ok", "model": MODEL_PATH, "runtime": "onnxruntime"}
+    return {"status": "ok", "model": "claude-haiku-4-5-20251001", "runtime": "anthropic"}
 
 
 @app.post("/api/detect-furniture")
 async def detect_furniture(request: Request):
-    """Primary endpoint for FloorPlan Studio."""
     body = await request.json()
     image_b64 = body.get("image")
     if not image_b64 or not isinstance(image_b64, str):
-        raise HTTPException(status_code=400, detail='Missing "image" (base64 string) in the request body.')
-    return _run_detection(image_b64)
+        raise HTTPException(status_code=400, detail='Missing "image" (base64 string) in request body.')
+    return _detect_with_claude(image_b64)
 
 
 @app.post("/detect")
 async def detect(request: Request):
-    """Legacy endpoint — returns raw predictions in nested format."""
     body = await request.json()
     image_b64 = body.get("image")
     if not image_b64 or not isinstance(image_b64, str):
-        raise HTTPException(status_code=400, detail='Missing "image" (base64 string) in the request body.')
-
-    try:
-        image_bytes = base64.b64decode(image_b64)
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not decode image.")
-
-    orig_w, orig_h = img.size
-    canvas, scale, pad_x, pad_y = letterbox(img, INPUT_SIZE)
-
-    arr = np.asarray(canvas, dtype=np.float32) / 255.0
-    arr = arr.transpose(2, 0, 1)[None, :, :, :]
-
-    outputs = session.run(None, {input_name: arr})
-    pred = outputs[0]
-    if pred.shape[1] < pred.shape[2]:
-        pred = pred[0].T
-    else:
-        pred = pred[0]
-
-    boxes_xywh = pred[:, :4]
-    class_scores = pred[:, 4:]
-    class_ids = np.argmax(class_scores, axis=1)
-    confidences = class_scores[np.arange(len(class_scores)), class_ids]
-
-    mask = confidences >= CONF_THRESHOLD
-    boxes_xywh, class_ids, confidences = boxes_xywh[mask], class_ids[mask], confidences[mask]
-
-    predictions = []
-    if len(boxes_xywh) > 0:
-        cx, cy, w, h = boxes_xywh[:, 0], boxes_xywh[:, 1], boxes_xywh[:, 2], boxes_xywh[:, 3]
-        x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
-        boxes_x1y1x2y2 = np.stack([x1, y1, x2, y2], axis=1)
-
-        keep = nms(boxes_x1y1x2y2, confidences, IOU_THRESHOLD)
-
-        for i in keep:
-            bcx = (cx[i] - pad_x) / scale
-            bcy = (cy[i] - pad_y) / scale
-            bw = w[i] / scale
-            bh = h[i] / scale
-            cls_id = int(class_ids[i])
-            cls_name = CLASS_NAMES[cls_id] if CLASS_NAMES and cls_id < len(CLASS_NAMES) else str(cls_id)
-            predictions.append({
-                "class": cls_name,
-                "confidence": float(confidences[i]),
-                "x": float(bcx),
-                "y": float(bcy),
-                "width": float(bw),
-                "height": float(bh),
-            })
-
-    return {
-        "outputs": [
-            {
-                "predictions": predictions,
-                "image": {"width": orig_w, "height": orig_h},
-            }
-        ]
-    }
+        raise HTTPException(status_code=400, detail='Missing "image" (base64 string) in request body.')
+    return _detect_with_claude(image_b64)
