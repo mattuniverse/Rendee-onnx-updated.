@@ -10,97 +10,50 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "best.onnx")
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.5"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.35"))
 IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", "0.45"))
 INPUT_SIZE = int(os.environ.get("INPUT_SIZE", "640"))
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
 
-# Class names for the [1, 62, 8400] YOLO model (58 classes). Read from the model's
-# own metadata ("names"). Override via CLASS_NAMES env var (comma-separated) if the
-# production model is retrained.
-_DEFAULT_CLASS_NAMES = [
-    "0", "Bed", "Cabinet", "Carpet", "Ceramic floor", "Chair", "Clock", "Closet",
-    "Computer", "Couch", "Cupboard", "Curtains", "Dining Table", "Door", "Frame",
-    "Gypsum Board", "Lamp", "Monitor", "Nightstand", "SOFA", "Shelf", "Sideboard",
-    "Sofa", "Swivel_C", "TV stand", "Table", "Transparent Closet", "Wall Futec",
-    "Wall Panel", "Window", "Windows", "Wooden floor", "air conditioner", "arm chair",
-    "bed", "ceiling fan", "chair", "closet", "cupboard", "dining table",
-    "dining-table", "dinning-table", "door", "drawer near bed", "frame",
-    "hanging lights", "lamp", "master bed", "nightstand", "photoframe", "shelf",
-    "sideboard", "sofa", "table", "transparent closet", "wall", "wardrobe", "windows",
-]
+CLASS_NAMES = os.environ.get("CLASS_NAMES", "").split(",") if os.environ.get("CLASS_NAMES") else None
 
-CLASS_NAMES = (os.environ.get("CLASS_NAMES", "") or ",".join(_DEFAULT_CLASS_NAMES)).split(",")
-
+# ── Class name → FloorPlan Studio furnitureId mapping ──
+# Keys are lowercase model class names; values are FURNITURE_DEFS IDs.
+# Override via CLASS_MAP env var as JSON, e.g. {"sofa":"sofa_3","couch":"sofa_3"}
 _DEFAULT_CLASS_MAP = {
-    # Model uses mixed casing (e.g. "Couch", "Dining Table", "TV stand"); maps are case-insensitive.
     "sofa": "sofa_3",
-    "sofa 2 seat": "sofa_2",
-    "sofa 3 seat": "sofa_3",
+    "couch": "sofa_3",
     "sofa2": "sofa_2",
     "sofa_2": "sofa_2",
     "sofa3": "sofa_3",
     "sofa_3": "sofa_3",
-    "couch": "sofa_3",
-    "loveseat": "sofa_2",
     "chair": "chair",
-    "dining chair": "chair",
-    "armchair": "armchair",
-    "arm chair": "armchair",
-    "lounge chair": "armchair",
-    "swivel_c": "chair",
+    "dining_table": "table_rect",
     "table": "table_rect",
-    "dining table": "table_rect",
-    "dining-table": "table_rect",
-    "dinning-table": "table_rect",
-    "round table": "table_round",
-    "coffee table": "coffee",
+    "coffee_table": "coffee",
     "desk": "desk",
-    "tv stand": "tv",
     "bed": "bed_d",
-    "master bed": "bed_d",
-    "single bed": "bed_s",
-    "double bed": "bed_d",
-    "king bed": "bed_k",
-    "drawer near bed": "cabinet",
-    "nightstand": "cabinet",
+    "single_bed": "bed_s",
+    "double_bed": "bed_d",
+    "king_bed": "bed_k",
     "toilet": "toilet",
     "sink": "sink",
     "bathtub": "bathtub",
-    "tub": "bathtub",
-    "plant": "plant",
-    "houseplant": "plant",
-    "potted_plant": "plant",
-    "potted plant": "plant",
     "tv": "tv",
-    "television": "tv",
     "tvmonitor": "tv",
     "monitor": "tv",
-    "computer": "tv",
+    "potted_plant": "plant",
+    "plant": "plant",
     "bookshelf": "shelf",
-    "bookcase": "shelf",
     "shelf": "shelf",
-    "sideboard": "cabinet",
     "cabinet": "cabinet",
-    "wall cabinet": "wall_cab",
     "wardrobe": "wardrobe",
-    "closet": "wardrobe",
-    "transparent closet": "wardrobe",
-    "cupboard": "cabinet",
     "door": "door",
     "window": "window",
-    "windows": "window",
+    "armchair": "armchair",
     "rug": "rug",
-    "carpet": "rug",
-    "wall": "wall",
-    "curtains": "wall_cab",
-    "ceiling fan": "wall_cab",
-    "air conditioner": "wall_cab",
-    "lamp": "tv",
-    "frame": "shelf",
-    "photoframe": "shelf",
+    "wall_cabinet": "wall_cab",
 }
-
 
 def _load_class_map():
     env_map = os.environ.get("CLASS_MAP", "")
@@ -118,7 +71,7 @@ app = FastAPI(title="FloorPlan Studio - furniture detection (ONNX)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST"],
     allow_headers=["*"],
 )
 
@@ -160,6 +113,7 @@ def nms(boxes, scores, iou_threshold):
 
 
 def _run_detection(image_b64: str):
+    """Core detection logic shared by all endpoints."""
     try:
         image_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -204,6 +158,7 @@ def _run_detection(image_b64: str):
             bh = h[i] / scale
             cls_id = int(class_ids[i])
 
+            # Resolve class name
             if CLASS_NAMES and cls_id < len(CLASS_NAMES):
                 cls_name = CLASS_NAMES[cls_id]
             else:
@@ -227,22 +182,13 @@ def _run_detection(image_b64: str):
 
     return {
         "detections": predictions,
-        "predictions": [
-            {
-                "class": p["class"],
-                "confidence": p["confidence"],
-                "x": p["x"],
-                "y": p["y"],
-                "width": p["width"],
-                "height": p["height"],
-            }
-            for p in predictions
-        ],
         "imageWidth": orig_w,
         "imageHeight": orig_h,
         "unmappedClasses": sorted(unmapped),
     }
 
+
+# ── Routes ──
 
 @app.get("/")
 def health():
@@ -251,6 +197,7 @@ def health():
 
 @app.post("/api/detect-furniture")
 async def detect_furniture(request: Request):
+    """Primary endpoint for FloorPlan Studio."""
     body = await request.json()
     image_b64 = body.get("image")
     if not image_b64 or not isinstance(image_b64, str):
@@ -260,8 +207,68 @@ async def detect_furniture(request: Request):
 
 @app.post("/detect")
 async def detect(request: Request):
+    """Legacy endpoint — returns raw predictions in nested format."""
     body = await request.json()
     image_b64 = body.get("image")
     if not image_b64 or not isinstance(image_b64, str):
         raise HTTPException(status_code=400, detail='Missing "image" (base64 string) in the request body.')
-    return _run_detection(image_b64)
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not decode image.")
+
+    orig_w, orig_h = img.size
+    canvas, scale, pad_x, pad_y = letterbox(img, INPUT_SIZE)
+
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
+    arr = arr.transpose(2, 0, 1)[None, :, :, :]
+
+    outputs = session.run(None, {input_name: arr})
+    pred = outputs[0]
+    if pred.shape[1] < pred.shape[2]:
+        pred = pred[0].T
+    else:
+        pred = pred[0]
+
+    boxes_xywh = pred[:, :4]
+    class_scores = pred[:, 4:]
+    class_ids = np.argmax(class_scores, axis=1)
+    confidences = class_scores[np.arange(len(class_scores)), class_ids]
+
+    mask = confidences >= CONF_THRESHOLD
+    boxes_xywh, class_ids, confidences = boxes_xywh[mask], class_ids[mask], confidences[mask]
+
+    predictions = []
+    if len(boxes_xywh) > 0:
+        cx, cy, w, h = boxes_xywh[:, 0], boxes_xywh[:, 1], boxes_xywh[:, 2], boxes_xywh[:, 3]
+        x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+        boxes_x1y1x2y2 = np.stack([x1, y1, x2, y2], axis=1)
+
+        keep = nms(boxes_x1y1x2y2, confidences, IOU_THRESHOLD)
+
+        for i in keep:
+            bcx = (cx[i] - pad_x) / scale
+            bcy = (cy[i] - pad_y) / scale
+            bw = w[i] / scale
+            bh = h[i] / scale
+            cls_id = int(class_ids[i])
+            cls_name = CLASS_NAMES[cls_id] if CLASS_NAMES and cls_id < len(CLASS_NAMES) else str(cls_id)
+            predictions.append({
+                "class": cls_name,
+                "confidence": float(confidences[i]),
+                "x": float(bcx),
+                "y": float(bcy),
+                "width": float(bw),
+                "height": float(bh),
+            })
+
+    return {
+        "outputs": [
+            {
+                "predictions": predictions,
+                "image": {"width": orig_w, "height": orig_h},
+            }
+        ]
+    }
